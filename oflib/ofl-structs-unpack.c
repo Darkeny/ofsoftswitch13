@@ -439,13 +439,13 @@ ofl_structs_bucket_unpack(struct ofp_bucket *src, size_t *len, uint8_t gtype, st
 
     blen = ntohs(src->len) - sizeof(struct ofp_bucket);
 
-    if (gtype == OFPGT_SELECT && ntohs(src->weight) == 0) {
-        OFL_LOG_WARN(LOG_MODULE, "Received bucket has no weight for SELECT group.");
+    if ( (gtype == OFPGT_SELECT || gtype == OFPGT_FLARE) && ntohs(src->weight) == 0 ) {
+        OFL_LOG_WARN(LOG_MODULE, "Received bucket has no weight for SELECT or FLARE group.");
         return ofl_error(OFPET_GROUP_MOD_FAILED, OFPGMFC_INVALID_GROUP);
     }
 
-    if (gtype != OFPGT_SELECT && ntohs(src->weight) > 0) {
-        OFL_LOG_WARN(LOG_MODULE, "Received bucket has weight for non-SELECT group.");
+    if ( (gtype != OFPGT_SELECT && gtype != OFPGT_FLARE) && ntohs(src->weight) > 0) {
+        OFL_LOG_WARN(LOG_MODULE, "Received bucket has weight for non-SELECT or non-FLARE group.");
         return ofl_error(OFPET_GROUP_MOD_FAILED, OFPGMFC_INVALID_GROUP);
     }
 

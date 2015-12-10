@@ -68,6 +68,13 @@ struct group_entry_wrr_data {
     size_t   curr_bucket; /* bucket executed last time. */
 };
 
+/* Private data for select groups; for implementing flare */
+struct group_entry_flare_data {
+	uint16_t buckets_num;
+	uint32_t total_weight;
+	uint32_t *token_counters;
+};
+
 static uint16_t
 gcd(uint16_t a, uint16_t b);
 
@@ -77,11 +84,17 @@ bucket_is_alive(struct ofl_bucket *bucket, struct datapath *dp);
 static void
 init_select_group(struct group_entry *entry, struct ofl_msg_group_mod *mod);
 
+static void
+init_flare_group(struct group_entry *entry, struct ofl_msg_group_mod *mod);
+
 static size_t
 select_from_select_group(struct group_entry *entry);
 
 static size_t
 select_from_ff_group(struct group_entry *entry);
+
+static size_t
+select_from_flare_group(struct group_entry *entry, struct packet *pkt);
 
 struct group_entry *
 group_entry_create(struct datapath *dp, struct group_table *table, struct ofl_msg_group_mod *mod) {
@@ -122,6 +135,10 @@ group_entry_create(struct datapath *dp, struct group_table *table, struct ofl_ms
             init_select_group(entry, mod);
             break;
         }
+        case (OFPGT_FLARE) : {
+        	init_flare_group(entry, mod);
+        	break;
+        }
         default: {
             entry->data = NULL;
         }
@@ -147,6 +164,10 @@ group_entry_destroy(struct group_entry *entry) {
 
     ofl_structs_free_group_desc_stats(entry->desc, entry->dp->exp);
     ofl_structs_free_group_stats(entry->stats);
+    if(entry->desc->type == OFPGT_FLARE) {
+    	struct group_entry_flare_data *data = entry->data;
+    	free(data->token_counters);
+    }
     free(entry->data);
     free(entry);
 }
@@ -273,6 +294,35 @@ execute_ff(struct group_entry *entry, struct packet *pkt) {
     }
 }
 
+/* Executes a group entry of type FLARE. */
+static void
+execute_flare(struct group_entry *entry, struct packet *pkt) {
+    size_t b  = select_from_flare_group(entry, pkt);
+
+    if (b != -1) {
+        struct ofl_bucket *bucket = entry->desc->buckets[b];
+
+        if (VLOG_IS_DBG_ENABLED(LOG_MODULE)) {
+            char *b = ofl_structs_bucket_to_string(bucket, entry->dp->exp);
+            VLOG_DBG_RL(LOG_MODULE, &rl, "Writing bucket: %s.", b);
+            free(b);
+        }
+
+        action_set_write_actions(pkt->action_set, bucket->actions_num, bucket->actions);
+
+        entry->stats->byte_count += pkt->buffer->size;
+        entry->stats->packet_count++;
+        entry->stats->counters[b]->byte_count += pkt->buffer->size;
+        entry->stats->counters[b]->packet_count++;
+        /* Cookie field is set 0xffffffffffffffff
+           because we cannot associate to any
+           particular flow */
+        action_set_execute(pkt->action_set, pkt, 0xffffffffffffffff);
+    } else {
+        VLOG_DBG_RL(LOG_MODULE, &rl, "No bucket in group.");
+        packet_destroy(pkt);
+    }
+}
 
 
 void
@@ -310,6 +360,10 @@ group_entry_execute(struct group_entry *entry,
         case (OFPGT_FF): {
             execute_ff(entry, packet);
             break;
+        }
+        case (OFPGT_FLARE) : {
+        	execute_flare(entry, packet);
+        	break;
         }
         default: {
             VLOG_WARN_RL(LOG_MODULE, &rl, "Trying to execute unknown group type (%u) in group (%u).", entry->desc->type, entry->stats->group_id);
@@ -460,6 +514,66 @@ select_from_select_group(struct group_entry *entry) {
         first_rand=0;
     }
     return rand() % entry->desc->buckets_num;  /* random int between 0 and buckets_num-1 */
+}
+
+/* Initializes the private w.r.r. data for a select group entry. */
+static void
+init_flare_group(struct group_entry *entry, struct ofl_msg_group_mod *mod) {
+	struct group_entry_flare_data *data;
+	entry->data = xmalloc(sizeof(struct group_entry_flare_data));
+	data = (struct group_entry_flare_data *)entry->data;
+	data->total_weight = 0;
+	size_t i;
+	if(entry->desc->buckets_num==0)
+	{
+		data->buckets_num = 0;
+		data->token_counters = 0;
+	}
+	else
+	{
+		data->buckets_num = entry->desc->buckets_num;
+		data->token_counters = xmalloc(entry->desc->buckets_num * sizeof(uint32_t));
+		for(i=0; i<entry->desc->buckets_num; i++)
+		{
+			data->total_weight += entry->desc->buckets[i]->weight;
+			data->token_counters[i] = 0;
+		}
+	}
+}
+
+/* Selects a bucket from a select group, based on the flare approach. */
+static size_t
+select_from_flare_group(struct group_entry *entry, struct packet *pkt) {
+	struct group_entry_flare_data *data;
+	if (entry->desc->buckets_num == 0)
+	{
+		return -1;
+	}
+	data = (struct group_entry_flare_data *)entry->data;
+	size_t i;
+	uint32_t maxToken = 0;
+	uint16_t maxIndex = 0;
+	for(i=0; i<entry->desc->buckets_num; i++)
+	{
+		uint32_t fraction = (entry->desc->buckets[i]->weight * 100) / data->total_weight;
+		data->token_counters[i] += (fraction * pkt->buffer->allocated /100);
+		if(data->token_counters[i] >= maxToken)
+		{
+			maxToken = data->token_counters[i];
+			maxIndex = i;
+		}
+	}
+	if(data->token_counters[maxIndex] <= (pkt->buffer->allocated))
+	{
+		data->token_counters[maxIndex] = 0;
+	}
+	else
+	{
+		(data->token_counters[maxIndex]) -= (pkt->buffer->allocated);
+	}
+	return maxIndex;
+    VLOG_WARN_RL(LOG_MODULE, &rl, "Could not select from select group.");
+    return -1;
 }
 
 
